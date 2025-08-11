@@ -1,7 +1,6 @@
-import React, { useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { AlertCircle, CheckCircle2, Info, TriangleAlert } from "lucide-react";
 
@@ -269,8 +268,8 @@ function parseFrame(
   const headerIdx = 2;
   const header = bytes[headerIdx];
   const seqIdx = headerIdx + 1;
-  const eofIdx =
-    2 /*SOF,Len*/ + expectedBytesFromHeaderThroughCRC + 1 /*EOF byte*/ - 1; // Last index: start at 0
+  //const eofIdx =
+  //  2 /*SOF,Len*/ + expectedBytesFromHeaderThroughCRC + 1 /*EOF byte*/ - 1; // Last index: start at 0
   const minTotal = 2 + expectedBytesFromHeaderThroughCRC + 1; // SOF + TL + (Header..CRC) + EOF
   if (bytes.length < minTotal) {
     errors.push(

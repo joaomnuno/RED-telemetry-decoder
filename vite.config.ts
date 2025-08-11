@@ -4,7 +4,7 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 // ⚠️ Se for um *project page* (https://username.github.io/<repo>):
-const repoName = '<repo>'       // <-- muda para o teu nome de repo
+const repoName = 'RED-telemetry-decoder'       // <-- muda para o teu nome de repo
 const isProjectPage = true
 
 // https://vite.dev/config/
