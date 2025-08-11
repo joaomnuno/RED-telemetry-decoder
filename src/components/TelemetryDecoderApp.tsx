@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { AlertCircle, CheckCircle2, Info, TriangleAlert } from "lucide-react";
 
@@ -541,9 +542,21 @@ function buildDemoFrame(opts: { valueEndian: Endian; sequenceEndian: Endian }) {
 }
 
 export default function TelemetryDecoderApp() {
+  const [tab, setTab] = useState<"decode" | "generate">("decode");
   const [hexInput, setHexInput] = useState<string>("");
   const [valueEndian, setValueEndian] = useState<Endian>("LE"); // common on ARM
   const [seqEndian, setSeqEndian] = useState<Endian>("BE"); // conservative default
+
+  // ===== Generator state =====
+  const [genType, setGenType] = useState<"Telemetry" | "Command">("Telemetry");
+  const [genFlags, setGenFlags] = useState<number>(0);
+  const [genSeq, setGenSeq] = useState<number>(42);
+  const [genEOF, setGenEOF] = useState<number>(EOF_V11);
+  const [genItems, setGenItems] = useState<
+    Array<{ id: number; value: string }>
+  >([]);
+  const [genOutHex, setGenOutHex] = useState<string>("");
+  const [genErrors, setGenErrors] = useState<string[]>([]);
 
   const decoded = useMemo<DecodedFrame | null>(() => {
     if (!hexInput.trim()) return null;
@@ -573,6 +586,190 @@ export default function TelemetryDecoderApp() {
 
   const loadDemo = () =>
     setHexInput(buildDemoFrame({ valueEndian, sequenceEndian: seqEndian }));
+
+  // ====== Generator helpers ======
+  const addGenItem = (id: number, value: string) =>
+    setGenItems((prev) => [...prev, { id, value }]);
+  const removeGenItem = (idx: number) =>
+    setGenItems((prev) => prev.filter((_, i) => i !== idx));
+  const clearGen = () => {
+    setGenItems([]);
+    setGenOutHex("");
+    setGenErrors([]);
+  };
+
+  function bytesToHex(bytes: number[], joiner = "") {
+    return bytes.map(hex2).join(joiner);
+  }
+
+  function encodeUInt16(n: number, endian: Endian) {
+    const v = Math.max(0, Math.min(0xffff, Math.floor(n)));
+    return endian === "LE"
+      ? [v & 0xff, (v >> 8) & 0xff]
+      : [(v >> 8) & 0xff, v & 0xff];
+  }
+  function encodeInt16(n: number, endian: Endian) {
+    let v = Math.round(n);
+    if (v < -32768 || v > 32767) v = ((v % 0x10000) + 0x10000) % 0x10000; // wrap
+    let u = v < 0 ? 0x10000 + v : v; // two's complement
+    u &= 0xffff;
+    return endian === "LE"
+      ? [u & 0xff, (u >> 8) & 0xff]
+      : [(u >> 8) & 0xff, u & 0xff];
+  }
+  function encodeUInt32(n: number, endian: Endian) {
+    const v = Math.max(0, Math.min(0xffffffff, Math.floor(n))); // clamp
+    if (endian === "LE")
+      return [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff];
+    return [(v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
+  }
+  function encodeFloat32(f: number, endian: Endian) {
+    const buf = new ArrayBuffer(4);
+    const dv = new DataView(buf);
+    dv.setFloat32(0, f, endian === "LE");
+    return [dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)];
+  }
+
+  function encodeTLVItem(
+    id: number,
+    valueStr: string,
+    endian: Endian
+  ): number[] | string {
+    const def = ArgDefs.find((d) => d.id === id);
+    if (!def) return `Unknown ArgID 0x${hex2(id)}`;
+
+    const fail = (msg: string) => `Arg ${hex2(id)} (${def.key}): ${msg}`;
+
+    try {
+      switch (def.key) {
+        case "millis": {
+          const n = Number(valueStr);
+          if (!Number.isFinite(n)) return fail("must be a number");
+          return [id, ...encodeUInt32(n, endian)];
+        }
+        case "altitude":
+        case "vertical_velocity":
+        case "vertical_acceleration":
+        case "gps_lat":
+        case "gps_long": {
+          const n = Number(valueStr);
+          if (!Number.isFinite(n)) return fail("must be a float");
+          return [id, ...encodeFloat32(n, endian)];
+        }
+        case "avionics_temperature":
+        case "cpu_temperature": {
+          const n = Number(valueStr);
+          if (!Number.isFinite(n)) return fail("must be an integer (°C)");
+          return [id, ...encodeInt16(n, endian)];
+        }
+        case "flight_mode": {
+          const n = Number(valueStr);
+          if (!Number.isInteger(n) || n < 0 || n > 255)
+            return fail("enum 0..255");
+          return [id, n & 0xff];
+        }
+        case "air_brakes": {
+          const n = Number(valueStr);
+          if (!Number.isInteger(n) || n < 0 || n > 100)
+            return fail("percent 0..100");
+          return [id, n & 0xff];
+        }
+        case "oxidizer_temperature": {
+          const n = Number(valueStr);
+          if (!Number.isFinite(n)) return fail("must be an integer (°C)");
+          return [id, ...encodeInt16(n, endian)];
+        }
+        case "oxidizer_pressure": {
+          // UI expects bar, wire is uint16 *0.1 bar
+          const bar = Number(valueStr);
+          if (!Number.isFinite(bar)) return fail("must be a number (bar)");
+          const raw = Math.round(bar * 10);
+          if (raw < 0 || raw > 65535) return fail("out of range after ×10");
+          return [id, ...encodeUInt16(raw, endian)];
+        }
+        case "valve_status": {
+          const n = Number(valueStr);
+          if (!Number.isInteger(n) || n < 0 || n > 255)
+            return fail("bitmask 0..255");
+          return [id, n & 0xff];
+        }
+        case "yaw":
+        case "pitch":
+        case "roll": {
+          // UI expects degrees, wire is int16 ×100
+          const deg = Number(valueStr);
+          if (!Number.isFinite(deg)) return fail("must be a number (degrees)");
+          const raw = Math.round(deg * 100);
+          return [id, ...encodeInt16(raw, endian)];
+        }
+        default:
+          return fail("unsupported field");
+      }
+    } catch (e: any) {
+      return fail(e?.message ?? String(e));
+    }
+  }
+
+  function buildGeneratedFrame() {
+    const errs: string[] = [];
+    const payload: number[] = [];
+    for (let i = 0; i < genItems.length; i++) {
+      const { id, value } = genItems[i];
+      const encoded = encodeTLVItem(id, value, valueEndian);
+      if (typeof encoded === "string") {
+        errs.push(encoded);
+        continue;
+      }
+      payload.push(...encoded);
+    }
+
+    if (genType !== "Telemetry") {
+      errs.push(
+        "Command frames: payload builder not implemented yet (needs CmdID table wiring)."
+      );
+    }
+
+    if (errs.length) {
+      setGenErrors(errs);
+      setGenOutHex("");
+      return;
+    }
+
+    // Header
+    const headerTypeBits =
+      genType === "Telemetry"
+        ? HEADER_TYPE.TELEMETRY << 6
+        : HEADER_TYPE.COMMAND << 6;
+    const header = (headerTypeBits | (genFlags & 0b0011_1111)) & 0xff;
+
+    // Sequence
+    let seqHi: number, seqLo: number;
+    const s = Math.max(0, Math.min(0xffff, Math.floor(genSeq)));
+    if (seqEndian === "BE") {
+      seqHi = (s >> 8) & 0xff;
+      seqLo = s & 0xff;
+    } else {
+      seqHi = s & 0xff;
+      seqLo = (s >> 8) & 0xff;
+    }
+
+    const headerThroughPayload = [header, seqHi, seqLo, ...payload];
+    const crc = crc16_modbus(headerThroughPayload);
+    const crcBE = [(crc >> 8) & 0xff, crc & 0xff];
+    const totalLength = headerThroughPayload.length + 2; // +CRC
+
+    const frame = [SOF, totalLength, ...headerThroughPayload, ...crcBE, genEOF];
+    const hex = bytesToHex(frame, "");
+    setGenOutHex(hex);
+    setGenErrors([]);
+  }
+
+  const loadGenIntoDecoder = () => {
+    if (genOutHex) {
+      setHexInput(genOutHex);
+      setTab("decode");
+    }
+  };
 
   return (
     <div className="mx-auto max-w-5xl p-4 space-y-6">
@@ -604,196 +801,401 @@ export default function TelemetryDecoderApp() {
         </div>
       </header>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Paste telemetry frame (hex)</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <Textarea
-            value={hexInput}
-            onChange={(e) => setHexInput(e.target.value)}
-            placeholder="e.g. FD 2A 00 00 2A 01 40 E2 01 00 … FE"
-            className="font-mono h-40"
-          />
-          <div className="flex gap-2">
-            <Button onClick={loadDemo} type="button">
-              Load demo frame
-            </Button>
-            <Button
-              variant="secondary"
-              type="button"
-              onClick={() => setHexInput("")}
-            >
-              Clear
-            </Button>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Accepts spaces, commas, newlines, and optional <code>0x</code>{" "}
-            prefixes. CRC-16 is Modbus (0xA001), computed over Header..Payload,
-            big-endian on the wire.
-          </p>
-        </CardContent>
-      </Card>
+      {/* Simple tabs */}
+      <div className="flex gap-2">
+        <Button
+          variant={tab === "decode" ? undefined : "secondary"}
+          onClick={() => setTab("decode")}
+        >
+          Decode
+        </Button>
+        <Button
+          variant={tab === "generate" ? undefined : "secondary"}
+          onClick={() => setTab("generate")}
+        >
+          Generate
+        </Button>
+      </div>
 
-      {decoded && (
-        <div className="grid md:grid-cols-2 gap-4">
+      {tab === "decode" && (
+        <>
           <Card>
             <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                Frame integrity{" "}
-                {decoded.ok ? (
-                  <CheckCircle2 className="w-5 h-5" />
-                ) : (
-                  <TriangleAlert className="w-5 h-5" />
-                )}
-              </CardTitle>
+              <CardTitle>Paste telemetry frame (hex)</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-2 text-sm">
-              <KV
-                label="Start-of-Frame"
-                value={`0x${hex2(decoded.start)}`}
-                good={decoded.start === SOF}
+            <CardContent className="space-y-3">
+              <Textarea
+                value={hexInput}
+                onChange={(e) => setHexInput(e.target.value)}
+                placeholder="e.g. FD 2A 00 00 2A 01 40 E2 01 00 … FE"
+                className="font-mono h-40"
               />
-              <KV
-                label="TotalLength (Header..CRC)"
-                value={`${decoded.totalLength} B`}
-              />
-              <KV
-                label="Header"
-                value={`0b${decoded.header.toString(2).padStart(8, "0")}`}
-              />
-              <KV label="Type" value={decoded.headerType} />
-              <KV
-                label="Flags (5..0)"
-                value={`0b${decoded.headerFlags.toString(2).padStart(6, "0")}`}
-              />
-              <KV label="Sequence" value={`${decoded.sequence}`} />
-              <KV
-                label="Payload bytes"
-                value={`${decoded.payloadBytes.length}`}
-              />
-              <KV label="CRC (rx)" value={`0x${hex4(decoded.crcRx)}`} />
-              <KV
-                label="CRC (calc)"
-                value={`0x${hex4(decoded.crcCalc)}`}
-                good={decoded.crcRx === decoded.crcCalc}
-              />
-              <KV
-                label="End-of-Frame"
-                value={`0x${hex2(decoded.eof)}`}
-                good={decoded.eof === EOF_V11}
-                warn={decoded.eof === EOF_TYPO}
-              />
-
-              {decoded.errors.length > 0 && (
-                <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-2">
-                  <div className="flex items-center gap-2 font-medium text-destructive">
-                    <AlertCircle className="w-4 h-4" /> Errors
-                  </div>
-                  <ul className="list-disc ml-6 text-destructive">
-                    {decoded.errors.map((e, i) => (
-                      <li key={i}>{e}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-              {decoded.warnings.length > 0 && (
-                <div className="mt-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-2">
-                  <div className="flex items-center gap-2 font-medium text-yellow-700">
-                    <Info className="w-4 h-4" /> Warnings
-                  </div>
-                  <ul className="list-disc ml-6 text-yellow-700">
-                    {decoded.warnings.map((w, i) => (
-                      <li key={i}>{w}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
+              <div className="flex gap-2">
+                <Button onClick={loadDemo} type="button">
+                  Load demo frame
+                </Button>
+                <Button
+                  variant="secondary"
+                  type="button"
+                  onClick={() => setHexInput("")}
+                >
+                  Clear
+                </Button>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                Accepts spaces, commas, newlines, and optional <code>0x</code>{" "}
+                prefixes. CRC-16 is Modbus (0xA001), computed over
+                Header..Payload, big-endian on the wire.
+              </p>
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Decoded payload</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {decoded.tlv.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No TLVs decoded. Check ArgIDs or endianness.
-                </p>
-              ) : (
-                <ul className="space-y-2">
-                  {decoded.tlv.map((t, idx) => {
-                    const row = renderTLVRow(t);
-                    return (
-                      <li key={idx} className="rounded-lg border p-2">
-                        <div className="flex justify-between text-sm">
-                          <span className="font-medium">{row.label}</span>
-                          <span className="font-mono">{row.value}</span>
-                        </div>
-                        {row.hint && (
-                          <div className="text-xs text-muted-foreground">
-                            {row.hint}
-                          </div>
-                        )}
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          raw: {t.valueRaw.map(hex2).join(" ")}
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </CardContent>
-          </Card>
+          {decoded && (
+            <div className="grid md:grid-cols-2 gap-4">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    Frame integrity{" "}
+                    {decoded.ok ? (
+                      <CheckCircle2 className="w-5 h-5" />
+                    ) : (
+                      <TriangleAlert className="w-5 h-5" />
+                    )}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-2 text-sm">
+                  <KV
+                    label="Start-of-Frame"
+                    value={`0x${hex2(decoded.start)}`}
+                    good={decoded.start === SOF}
+                  />
+                  <KV
+                    label="TotalLength (Header..CRC)"
+                    value={`${decoded.totalLength} B`}
+                  />
+                  <KV
+                    label="Header"
+                    value={`0b${decoded.header.toString(2).padStart(8, "0")}`}
+                  />
+                  <KV label="Type" value={decoded.headerType} />
+                  <KV
+                    label="Flags (5..0)"
+                    value={`0b${decoded.headerFlags
+                      .toString(2)
+                      .padStart(6, "0")}`}
+                  />
+                  <KV label="Sequence" value={`${decoded.sequence}`} />
+                  <KV
+                    label="Payload bytes"
+                    value={`${decoded.payloadBytes.length}`}
+                  />
+                  <KV label="CRC (rx)" value={`0x${hex4(decoded.crcRx)}`} />
+                  <KV
+                    label="CRC (calc)"
+                    value={`0x${hex4(decoded.crcCalc)}`}
+                    good={decoded.crcRx === decoded.crcCalc}
+                  />
+                  <KV
+                    label="End-of-Frame"
+                    value={`0x${hex2(decoded.eof)}`}
+                    good={decoded.eof === EOF_V11}
+                    warn={decoded.eof === EOF_TYPO}
+                  />
 
-          <Card className="md:col-span-2">
-            <CardHeader>
-              <CardTitle>Raw bytes</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {decoded.raw.length === 0 ? (
-                <p className="text-sm text-muted-foreground">—</p>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead>
-                      <tr className="text-left">
-                        <th className="py-1 pr-2">Idx</th>
-                        <th className="py-1 pr-2">Hex</th>
-                        <th className="py-1 pr-2">Dec</th>
-                        <th className="py-1 pr-2">Meaning</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {decoded.raw.map((b, i) => {
-                        let meaning = "";
-                        if (i === 0) meaning = "SOF";
-                        else if (i === 1) meaning = "TotalLength";
-                        else if (i === 2) meaning = "Header";
-                        else if (i === 3 || i === 4) meaning = "Sequence";
-                        else if (i === 2 + decoded.totalLength - 2)
-                          meaning = "CRC Hi";
-                        else if (i === 2 + decoded.totalLength - 1)
-                          meaning = "CRC Lo";
-                        else if (i === 2 + decoded.totalLength) meaning = "EOF";
-                        else meaning = "Payload";
+                  {decoded.errors.length > 0 && (
+                    <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-2">
+                      <div className="flex items-center gap-2 font-medium text-destructive">
+                        <AlertCircle className="w-4 h-4" /> Errors
+                      </div>
+                      <ul className="list-disc ml-6 text-destructive">
+                        {decoded.errors.map((e, i) => (
+                          <li key={i}>{e}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {decoded.warnings.length > 0 && (
+                    <div className="mt-2 rounded-md border border-yellow-500/30 bg-yellow-500/10 p-2">
+                      <div className="flex items-center gap-2 font-medium text-yellow-700">
+                        <Info className="w-4 h-4" /> Warnings
+                      </div>
+                      <ul className="list-disc ml-6 text-yellow-700">
+                        {decoded.warnings.map((w, i) => (
+                          <li key={i}>{w}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle>Decoded payload</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {decoded.tlv.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      No TLVs decoded. Check ArgIDs or endianness.
+                    </p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {decoded.tlv.map((t, idx) => {
+                        const row = renderTLVRow(t);
                         return (
-                          <tr key={i} className="border-t">
-                            <td className="py-1 pr-2 font-mono">{i}</td>
-                            <td className="py-1 pr-2 font-mono">{hex2(b)}</td>
-                            <td className="py-1 pr-2 font-mono">{b}</td>
-                            <td className="py-1 pr-2">{meaning}</td>
-                          </tr>
+                          <li key={idx} className="rounded-lg border p-2">
+                            <div className="flex justify-between text-sm">
+                              <span className="font-medium">{row.label}</span>
+                              <span className="font-mono">{row.value}</span>
+                            </div>
+                            {row.hint && (
+                              <div className="text-xs text-muted-foreground">
+                                {row.hint}
+                              </div>
+                            )}
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              raw: {t.valueRaw.map(hex2).join(" ")}
+                            </div>
+                          </li>
                         );
                       })}
-                    </tbody>
-                  </table>
+                    </ul>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="md:col-span-2">
+                <CardHeader>
+                  <CardTitle>Raw bytes</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  {decoded.raw.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">—</p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="text-left">
+                            <th className="py-1 pr-2">Idx</th>
+                            <th className="py-1 pr-2">Hex</th>
+                            <th className="py-1 pr-2">Dec</th>
+                            <th className="py-1 pr-2">Meaning</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {decoded.raw.map((b, i) => {
+                            let meaning = "";
+                            if (i === 0) meaning = "SOF";
+                            else if (i === 1) meaning = "TotalLength";
+                            else if (i === 2) meaning = "Header";
+                            else if (i === 3 || i === 4) meaning = "Sequence";
+                            else if (i === 2 + decoded.totalLength - 2)
+                              meaning = "CRC Hi";
+                            else if (i === 2 + decoded.totalLength - 1)
+                              meaning = "CRC Lo";
+                            else if (i === 2 + decoded.totalLength)
+                              meaning = "EOF";
+                            else meaning = "Payload";
+                            return (
+                              <tr key={i} className="border-t">
+                                <td className="py-1 pr-2 font-mono">{i}</td>
+                                <td className="py-1 pr-2 font-mono">
+                                  {hex2(b)}
+                                </td>
+                                <td className="py-1 pr-2 font-mono">{b}</td>
+                                <td className="py-1 pr-2">{meaning}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          )}
+        </>
+      )}
+
+      {tab === "generate" && (
+        <>
+          <Card>
+            <CardHeader>
+              <CardTitle>Build a telemetry frame</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid sm:grid-cols-2 gap-3 text-sm">
+                <label className="flex items-center justify-between gap-2">
+                  Type
+                  <select
+                    className="border rounded-md px-2 py-1"
+                    value={genType}
+                    onChange={(e) => setGenType(e.target.value as any)}
+                  >
+                    <option>Telemetry</option>
+                    <option>Command</option>
+                  </select>
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                  Flags (0..63)
+                  <input
+                    type="number"
+                    className="border rounded-md px-2 py-1 w-28"
+                    value={genFlags}
+                    min={0}
+                    max={63}
+                    onChange={(e) => setGenFlags(Number(e.target.value))}
+                  />
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                  Sequence (0..65535)
+                  <input
+                    type="number"
+                    className="border rounded-md px-2 py-1 w-28"
+                    value={genSeq}
+                    min={0}
+                    max={65535}
+                    onChange={(e) => setGenSeq(Number(e.target.value))}
+                  />
+                </label>
+                <label className="flex items-center justify-between gap-2">
+                  EOF
+                  <select
+                    className="border rounded-md px-2 py-1"
+                    value={genEOF}
+                    onChange={(e) => setGenEOF(Number(e.target.value))}
+                  >
+                    <option value={EOF_V11}>0xFE (v1.1)</option>
+                    <option value={EOF_TYPO}>0xF1 (compat)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="rounded-md border p-3 space-y-3">
+                <div className="font-medium">Add TLVs</div>
+                <TLVAdder onAdd={addGenItem} />
+                {genItems.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">
+                    No TLVs yet — add some above.
+                  </p>
+                ) : (
+                  <ul className="space-y-2">
+                    {genItems.map((it, idx) => {
+                      const def = ArgDefs.find((d) => d.id === it.id)!;
+                      const preview = encodeTLVItem(
+                        it.id,
+                        it.value,
+                        valueEndian
+                      );
+                      const err = typeof preview === "string" ? preview : null;
+                      const raw = Array.isArray(preview)
+                        ? preview.slice(1)
+                        : [];
+                      const dec = Array.isArray(preview)
+                        ? decodeTLV(raw, valueEndian)[0]
+                        : undefined;
+                      return (
+                        <li key={idx} className="rounded-lg border p-2 text-sm">
+                          <div className="flex items-center justify-between gap-2">
+                            <div>
+                              <div className="font-medium">
+                                0x{hex2(def.id)} {def.key}
+                              </div>
+                              <div className="text-xs text-muted-foreground">
+                                value:{" "}
+                                <span className="font-mono">{it.value}</span>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {err ? (
+                                <span className="text-red-600 text-xs">
+                                  {err}
+                                </span>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">
+                                  raw: {raw.map(hex2).join(" ")}
+                                </span>
+                              )}
+                              <Button
+                                variant="secondary"
+                                onClick={() => removeGenItem(idx)}
+                              >
+                                Remove
+                              </Button>
+                            </div>
+                          </div>
+                          {dec && (
+                            <div className="mt-1 text-xs">
+                              as decoded →{" "}
+                              {
+                                renderTLVRow({
+                                  id: it.id,
+                                  name: def.key as any,
+                                  bytes: def.bytes,
+                                  valueRaw: raw,
+                                  valueDecoded: (dec as any).valueDecoded,
+                                }).value
+                              }
+                            </div>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+
+                <div className="flex gap-2">
+                  <Button onClick={buildGeneratedFrame}>Build frame</Button>
+                  <Button variant="secondary" onClick={clearGen}>
+                    Clear
+                  </Button>
                 </div>
-              )}
+
+                {genErrors.length > 0 && (
+                  <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-2">
+                    <div className="flex items-center gap-2 font-medium text-destructive">
+                      <AlertCircle className="w-4 h-4" /> Errors
+                    </div>
+                    <ul className="list-disc ml-6 text-destructive text-sm">
+                      {genErrors.map((e, i) => (
+                        <li key={i}>{e}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {genOutHex && (
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">Frame (hex)</div>
+                    <Textarea
+                      className="font-mono h-32"
+                      value={genOutHex}
+                      readOnly
+                    />
+                    <div className="flex gap-2">
+                      <Button
+                        type="button"
+                        onClick={() => {
+                          navigator.clipboard?.writeText(genOutHex);
+                        }}
+                      >
+                        Copy hex
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={loadGenIntoDecoder}
+                      >
+                        Load into decoder
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
             </CardContent>
           </Card>
-        </div>
+        </>
       )}
 
       <footer className="text-xs text-muted-foreground">
@@ -829,4 +1231,109 @@ function KV({
       </span>
     </div>
   );
+}
+
+// Minimal TLV adder UI
+function TLVAdder({ onAdd }: { onAdd: (id: number, value: string) => void }) {
+  const [id, setId] = useState<number>(ArgDefs[0].id);
+  const [value, setValue] = useState<string>("");
+  const def = ArgDefs.find((d) => d.id === id)!;
+  return (
+    <div className="grid md:grid-cols-[200px_1fr_auto] gap-2 items-end">
+      <label className="text-sm">
+        <div className="mb-1 font-medium">Arg</div>
+        <select
+          className="border rounded-md px-2 py-1 w-full"
+          value={id}
+          onChange={(e) => setId(Number(e.target.value))}
+        >
+          {ArgDefs.map((d) => (
+            <option key={d.id} value={d.id}>
+              0x{hex2(d.id)} — {d.key}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="text-sm">
+        <div className="mb-1 font-medium">
+          Value{" "}
+          {def.key === "oxidizer_pressure"
+            ? "(bar)"
+            : def.key === "yaw" || def.key === "pitch" || def.key === "roll"
+            ? "(deg)"
+            : ""}
+        </div>
+        <Input
+          placeholder={placeholderFor(def.key)}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+        />
+        <div className="text-xs text-muted-foreground mt-1">
+          {hintFor(def.key)}
+        </div>
+      </label>
+
+      <div>
+        <Button
+          onClick={() => {
+            if (value.trim() !== "") {
+              onAdd(id, value.trim());
+              setValue("");
+            }
+          }}
+        >
+          Add
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function placeholderFor(key: string) {
+  switch (key) {
+    case "millis":
+      return "123456";
+    case "altitude":
+      return "326.5";
+    case "vertical_velocity":
+      return "-14.5";
+    case "vertical_acceleration":
+      return "0.0";
+    case "avionics_temperature":
+    case "cpu_temperature":
+      return "25";
+    case "flight_mode":
+      return "0..8";
+    case "air_brakes":
+      return "0..100";
+    case "oxidizer_temperature":
+      return "20";
+    case "oxidizer_pressure":
+      return "12.3  (bar)";
+    case "valve_status":
+      return "bitmask 0..255";
+    case "gps_lat":
+      return "38.736946";
+    case "gps_long":
+      return "-9.142685";
+    case "yaw":
+    case "pitch":
+    case "roll":
+      return "12.34  (deg)";
+    default:
+      return "";
+  }
+}
+function hintFor(key: string) {
+  switch (key) {
+    case "oxidizer_pressure":
+      return "Will be encoded as uint16 of (bar × 10).";
+    case "yaw":
+    case "pitch":
+    case "roll":
+      return "Will be encoded as int16 of (deg × 100).";
+    default:
+      return "";
+  }
 }
