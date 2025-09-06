@@ -18,6 +18,12 @@ const HEADER_TYPE = {
   COMMAND: 0b11,
 } as const;
 
+// Header flag bits
+const FLAG_VALUE_BIG = 0b000001; // TLV values big-endian if set
+const FLAG_SEQ_LITTLE = 0b000010; // Sequence little-endian if set
+
+type Endian = "LE" | "BE";
+
 type DecodedFrame = {
   ok: boolean;
   warnings: string[];
@@ -28,6 +34,8 @@ type DecodedFrame = {
   header: number;
   headerType: "Telemetry" | "Command" | "Unknown";
   headerFlags: number; // lower 6 bits
+  valueEndian: Endian;
+  sequenceEndian: Endian;
   sequence: number;
   payloadBytes: number[];
   crcRx: number; // received (big-endian)
@@ -40,6 +48,7 @@ type DecodedFrame = {
     valueRaw: number[];
     valueDecoded: unknown;
   }>; // decoded TLVs
+  command: { id: number; name: string } | null;
 };
 
 // ArgID map — fixed-size TLVs
@@ -102,9 +111,10 @@ const ArgDefs = [
   { id: 0x0e, key: "yaw", bytes: 2, type: "int16", note: "deg ×100" },
   { id: 0x0f, key: "pitch", bytes: 2, type: "int16", note: "deg ×100" },
   { id: 0x10, key: "roll", bytes: 2, type: "int16", note: "deg ×100" },
+  { id: 0x20, key: "oxidizer_pressure_1", bytes: 4, type: "float", note: "bar" },
+  { id: 0x21, key: "oxidizer_pressure_2", bytes: 4, type: "float", note: "bar" },
+  { id: 0x22, key: "oxidizer_pressure_3", bytes: 4, type: "float", note: "bar" },
 ] as const;
-
-type Endian = "LE" | "BE";
 
 const FLIGHT_MODES = [
   "STARTUP",
@@ -116,6 +126,22 @@ const FLIGHT_MODES = [
   "MAIN_DESCEND",
   "TOUCHDOWN",
   "ABORT",
+] as const;
+
+// Command ID map
+const CommandDefs = [
+  { id: 0x80, key: "ABORT" },
+  { id: 0x81, key: "SET_FLIGHT_MODE" },
+  { id: 0x82, key: "SET_AIR_BRAKE" },
+  { id: 0xa0, key: "OPEN_MAINVALVE" },
+  { id: 0xa1, key: "OPEN_SECVALVE" },
+  { id: 0xa2, key: "OPEN_VENTVALVE" },
+  { id: 0xa3, key: "OPEN_PURGEVALVE" },
+  { id: 0xb0, key: "CLOSE_MAINVALVE" },
+  { id: 0xb1, key: "CLOSE_SECVALVE" },
+  { id: 0xb2, key: "CLOSE_VENTVALVE" },
+  { id: 0xb3, key: "CLOSE_PURGEVALVE" },
+  { id: 0x7f, key: "PING" },
 ] as const;
 
 // CRC-16 (Modbus 0xA001) — compute over Header..Payload
@@ -244,10 +270,7 @@ function decodeTLV(payload: number[], valueEndian: Endian) {
 }
 
 // Main parser
-function parseFrame(
-  bytes: number[],
-  opts: { valueEndian: Endian; sequenceEndian: Endian }
-): DecodedFrame {
+function parseFrame(bytes: number[]): DecodedFrame {
   const warnings: string[] = [];
   const errors: string[] = [];
 
@@ -268,6 +291,18 @@ function parseFrame(
   const expectedBytesFromHeaderThroughCRC = totalLength;
   const headerIdx = 2;
   const header = bytes[headerIdx];
+  const typeBits = (header >> 6) & 0b11;
+  const headerType =
+    typeBits === HEADER_TYPE.TELEMETRY
+      ? "Telemetry"
+      : typeBits === HEADER_TYPE.COMMAND
+      ? "Command"
+      : "Unknown";
+  const headerFlags = header & 0b0011_1111;
+  const valueEndian: Endian =
+    headerFlags & FLAG_VALUE_BIG ? "BE" : "LE";
+  const sequenceEndian: Endian =
+    headerFlags & FLAG_SEQ_LITTLE ? "LE" : "BE";
   const seqIdx = headerIdx + 1;
   //const eofIdx =
   //  2 /*SOF,Len*/ + expectedBytesFromHeaderThroughCRC + 1 /*EOF byte*/ - 1; // Last index: start at 0
@@ -282,7 +317,7 @@ function parseFrame(
   const seqHi = bytes[seqIdx];
   const seqLo = bytes[seqIdx + 1];
   const sequence =
-    opts.sequenceEndian === "BE" ? (seqHi << 8) | seqLo : (seqLo << 8) | seqHi;
+    sequenceEndian === "BE" ? (seqHi << 8) | seqLo : (seqLo << 8) | seqHi;
 
   // Payload spans from after sequence up to the CRC (2 bytes at end of the counted region)
   const payloadStart = seqIdx + 2;
@@ -314,29 +349,40 @@ function parseFrame(
     }
   }
 
-  // Header decode
-  const typeBits = (header >> 6) & 0b11;
-  const headerType =
-    typeBits === HEADER_TYPE.TELEMETRY
-      ? "Telemetry"
-      : typeBits === HEADER_TYPE.COMMAND
-      ? "Command"
-      : "Unknown";
-  const headerFlags = header & 0b0011_1111;
+  // Header decode done above
+  let tlv: DecodedFrame["tlv"] = [];
+  let command: { id: number; name: string } | null = null;
 
-  // TLV decode
-  const tlv = decodeTLV(payloadBytes, opts.valueEndian);
+  if (headerType === "Telemetry") {
+    tlv = decodeTLV(payloadBytes, valueEndian);
 
-  // Sanity checks on TLV integrity
-  const seenBytes = tlv.reduce((acc, t) => acc + 1 + t.bytes, 0);
-  if (seenBytes !== payloadBytes.length) {
-    const unknownAt =
-      payloadBytes[seenBytes] !== undefined
-        ? `0x${hex2(payloadBytes[seenBytes])}`
-        : "<end>";
-    warnings.push(
-      `Payload parsing stopped early at byte ${seenBytes}/${payloadBytes.length}. Likely unknown ArgID (${unknownAt}) or truncated value.`
-    );
+    // Sanity checks on TLV integrity
+    const seenBytes = tlv.reduce((acc, t) => acc + 1 + t.bytes, 0);
+    if (seenBytes !== payloadBytes.length) {
+      const unknownAt =
+        payloadBytes[seenBytes] !== undefined
+          ? `0x${hex2(payloadBytes[seenBytes])}`
+          : "<end>";
+      warnings.push(
+        `Payload parsing stopped early at byte ${seenBytes}/${payloadBytes.length}. Likely unknown ArgID (${unknownAt}) or truncated value.`
+      );
+    }
+  } else if (headerType === "Command") {
+    if (payloadBytes.length === 0) {
+      warnings.push("Command frame has no Command ID byte.");
+    } else {
+      const cmdId = payloadBytes[0];
+      const def = CommandDefs.find((c) => c.id === cmdId);
+      command = {
+        id: cmdId,
+        name: def ? def.key : `UNKNOWN(0x${hex2(cmdId)})`,
+      };
+      if (payloadBytes.length > 1) {
+        warnings.push(
+          `Command frame has ${payloadBytes.length - 1} extra payload byte(s).`
+        );
+      }
+    }
   }
 
   if (crcRx !== crcCalc) {
@@ -357,12 +403,15 @@ function parseFrame(
     header,
     headerType,
     headerFlags,
+    valueEndian,
+    sequenceEndian,
     sequence,
     payloadBytes,
     crcRx,
     crcCalc,
     eof,
     tlv,
+    command,
   };
 
   function baseResult(): DecodedFrame {
@@ -376,12 +425,15 @@ function parseFrame(
       header: 0,
       headerType: "Unknown",
       headerFlags: 0,
+      valueEndian: "LE",
+      sequenceEndian: "BE",
       sequence: 0,
       payloadBytes: [],
       crcRx: 0,
       crcCalc: 0,
       eof: 0,
       tlv: [],
+      command: null,
     };
   }
 }
@@ -448,6 +500,13 @@ function renderTLVRow(t: DecodedFrame["tlv"][number]): {
         hint: `${raw} (×0.1 bar)`,
       };
     }
+    case "oxidizer_pressure_1":
+    case "oxidizer_pressure_2":
+    case "oxidizer_pressure_3":
+      return {
+        label: `${idHex} ${t.name}`,
+        value: `${(t.valueDecoded as number).toFixed(2)} bar`,
+      };
     case "valve_status": {
       const b = t.valueDecoded as number;
       const bits = Array.from({ length: 8 }, (_, i) =>
@@ -522,7 +581,9 @@ function buildDemoFrame(opts: { valueEndian: Endian; sequenceEndian: Endian }) {
   pushTLV(0x0f, enc16(Math.round(-2.5 * 100))); // pitch ×100 (two's complement)
 
   const headerTypeBits = HEADER_TYPE.TELEMETRY << 6; // 0b00 in top bits
-  const headerFlags = 0; // reserved
+  const headerFlags =
+    (opts.valueEndian === "BE" ? FLAG_VALUE_BIG : 0) |
+    (opts.sequenceEndian === "LE" ? FLAG_SEQ_LITTLE : 0);
   const header = headerTypeBits | headerFlags;
 
   const sequenceVal = 42;
@@ -562,27 +623,30 @@ export default function TelemetryDecoderApp() {
     if (!hexInput.trim()) return null;
     try {
       const bytes = hexToBytes(hexInput);
-      return parseFrame(bytes, { valueEndian, sequenceEndian: seqEndian });
-    } catch (e: any) {
+      return parseFrame(bytes);
+    } catch (e) {
       return {
         ok: false,
         warnings: [],
-        errors: [e.message ?? String(e)],
+        errors: [e instanceof Error ? e.message : String(e)],
         raw: [],
         start: 0,
         totalLength: 0,
         header: 0,
         headerType: "Unknown",
         headerFlags: 0,
+        valueEndian: "LE",
+        sequenceEndian: "BE",
         sequence: 0,
         payloadBytes: [],
         crcRx: 0,
         crcCalc: 0,
         eof: 0,
         tlv: [],
+        command: null,
       };
     }
-  }, [hexInput, valueEndian, seqEndian]);
+  }, [hexInput]);
 
   const loadDemo = () =>
     setHexInput(buildDemoFrame({ valueEndian, sequenceEndian: seqEndian }));
@@ -656,6 +720,13 @@ export default function TelemetryDecoderApp() {
           if (!Number.isFinite(n)) return fail("must be a float");
           return [id, ...encodeFloat32(n, endian)];
         }
+        case "oxidizer_pressure_1":
+        case "oxidizer_pressure_2":
+        case "oxidizer_pressure_3": {
+          const n = Number(valueStr);
+          if (!Number.isFinite(n)) return fail("must be a float");
+          return [id, ...encodeFloat32(n, endian)];
+        }
         case "avionics_temperature":
         case "cpu_temperature": {
           const n = Number(valueStr);
@@ -705,8 +776,8 @@ export default function TelemetryDecoderApp() {
         default:
           return fail("unsupported field");
       }
-    } catch (e: any) {
-      return fail(e?.message ?? String(e));
+    } catch (e) {
+      return fail(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -740,7 +811,13 @@ export default function TelemetryDecoderApp() {
       genType === "Telemetry"
         ? HEADER_TYPE.TELEMETRY << 6
         : HEADER_TYPE.COMMAND << 6;
-    const header = (headerTypeBits | (genFlags & 0b0011_1111)) & 0xff;
+    const autoFlags =
+      (valueEndian === "BE" ? FLAG_VALUE_BIG : 0) |
+      (seqEndian === "LE" ? FLAG_SEQ_LITTLE : 0);
+    const userFlags = genFlags & 0b0011_1111;
+    const headerFlags =
+      (userFlags & ~(FLAG_VALUE_BIG | FLAG_SEQ_LITTLE)) | autoFlags;
+    const header = (headerTypeBits | headerFlags) & 0xff;
 
     // Sequence
     let seqHi: number, seqLo: number;
@@ -884,6 +961,11 @@ export default function TelemetryDecoderApp() {
                       .toString(2)
                       .padStart(6, "0")}`}
                   />
+                  <KV label="Value endian" value={decoded.valueEndian} />
+                  <KV
+                    label="Sequence endian"
+                    value={decoded.sequenceEndian}
+                  />
                   <KV label="Sequence" value={`${decoded.sequence}`} />
                   <KV
                     label="Payload bytes"
@@ -934,7 +1016,17 @@ export default function TelemetryDecoderApp() {
                   <CardTitle>Decoded payload</CardTitle>
                 </CardHeader>
                 <CardContent>
-                  {decoded.tlv.length === 0 ? (
+                  {decoded.headerType === "Command" ? (
+                    decoded.command ? (
+                      <p className="text-sm">
+                        Command: 0x{hex2(decoded.command.id)} {decoded.command.name}
+                      </p>
+                    ) : (
+                      <p className="text-sm text-muted-foreground">
+                        No Command ID decoded.
+                      </p>
+                    )
+                  ) : decoded.tlv.length === 0 ? (
                     <p className="text-sm text-muted-foreground">
                       No TLVs decoded. Check ArgIDs or endianness.
                     </p>
@@ -1031,7 +1123,9 @@ export default function TelemetryDecoderApp() {
                   <select
                     className="border rounded-md px-2 py-1"
                     value={genType}
-                    onChange={(e) => setGenType(e.target.value as any)}
+                    onChange={(e) =>
+                      setGenType(e.target.value as "Telemetry" | "Command")
+                    }
                   >
                     <option>Telemetry</option>
                     <option>Command</option>
@@ -1093,7 +1187,7 @@ export default function TelemetryDecoderApp() {
                         ? preview.slice(1)
                         : [];
                       const dec = Array.isArray(preview)
-                        ? decodeTLV(raw, valueEndian)[0]
+                        ? decodeTLV(preview, valueEndian)[0]
                         : undefined;
                       return (
                         <li key={idx} className="rounded-lg border p-2 text-sm">
@@ -1128,15 +1222,7 @@ export default function TelemetryDecoderApp() {
                           {dec && (
                             <div className="mt-1 text-xs">
                               as decoded →{" "}
-                              {
-                                renderTLVRow({
-                                  id: it.id,
-                                  name: def.key as any,
-                                  bytes: def.bytes,
-                                  valueRaw: raw,
-                                  valueDecoded: (dec as any).valueDecoded,
-                                }).value
-                              }
+                              {renderTLVRow(dec).value}
                             </div>
                           )}
                         </li>
@@ -1311,6 +1397,10 @@ function placeholderFor(key: string) {
       return "20";
     case "oxidizer_pressure":
       return "12.3  (bar)";
+    case "oxidizer_pressure_1":
+    case "oxidizer_pressure_2":
+    case "oxidizer_pressure_3":
+      return "12.3  (bar)";
     case "valve_status":
       return "bitmask 0..255";
     case "gps_lat":
@@ -1329,6 +1419,10 @@ function hintFor(key: string) {
   switch (key) {
     case "oxidizer_pressure":
       return "Will be encoded as uint16 of (bar × 10).";
+    case "oxidizer_pressure_1":
+    case "oxidizer_pressure_2":
+    case "oxidizer_pressure_3":
+      return "Will be encoded as float32.";
     case "yaw":
     case "pitch":
     case "roll":
