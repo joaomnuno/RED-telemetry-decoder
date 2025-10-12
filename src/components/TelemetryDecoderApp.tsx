@@ -72,30 +72,21 @@ type DecodedFrame = {
 };
 
 // ArgID map — fixed-size TLVs
-const ArgDefs: readonly ArgDef[] = [
+const ArgDefs = [
   {
     id: 0x01,
     key: "millis",
     bytes: 4,
     type: "uint32",
     note: "time since boot, ms",
-    endian: "LE",
   },
-  {
-    id: 0x02,
-    key: "altitude",
-    bytes: 4,
-    type: "float",
-    note: "altitude AGL, m",
-    endian: "LE",
-  },
+  { id: 0x02, key: "altitude", bytes: 4, type: "float", note: "altitude AGL, m" },
   {
     id: 0x03,
     key: "vertical_velocity",
     bytes: 4,
     type: "float",
     note: "vertical speed, m/s",
-    endian: "LE",
   },
   {
     id: 0x04,
@@ -103,7 +94,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 4,
     type: "float",
     note: "vertical accel, m/s²",
-    endian: "LE",
   },
   {
     id: 0x05,
@@ -111,7 +101,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 2,
     type: "int16",
     note: "avionics °C ×10",
-    endian: "BE",
   },
   {
     id: 0x06,
@@ -119,7 +108,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 2,
     type: "int16",
     note: "CPU °C ×10",
-    endian: "BE",
   },
   {
     id: 0x07,
@@ -127,23 +115,14 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 1,
     type: "enum",
     note: "flight-mode enum",
-    endian: "LE",
   },
-  {
-    id: 0x08,
-    key: "air_brakes",
-    bytes: 1,
-    type: "uint8",
-    note: "air-brakes %",
-    endian: "LE",
-  },
+  { id: 0x08, key: "air_brakes", bytes: 1, type: "uint8", note: "air-brakes %" },
   {
     id: 0x09,
     key: "oxidizer_temperature",
     bytes: 2,
     type: "int16",
     note: "oxidizer °C ×10",
-    endian: "BE",
   },
   {
     id: 0x0a,
@@ -151,7 +130,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 2,
     type: "uint16",
     note: "oxidizer pressure, bar",
-    endian: "BE",
   },
   {
     id: 0x0b,
@@ -159,48 +137,18 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 1,
     type: "bitfield",
     note: "valve bitmask",
-    endian: "LE",
   },
-  {
-    id: 0x0c,
-    key: "gps_lat",
-    bytes: 4,
-    type: "float",
-    note: "GPS latitude",
-    endian: "LE",
-  },
-  {
-    id: 0x0d,
-    key: "gps_long",
-    bytes: 4,
-    type: "float",
-    note: "GPS longitude",
-    endian: "LE",
-  },
-  { id: 0x0e, key: "yaw", bytes: 2, type: "int16", note: "deg ×100", endian: "BE" },
-  {
-    id: 0x0f,
-    key: "pitch",
-    bytes: 2,
-    type: "int16",
-    note: "deg ×100",
-    endian: "BE",
-  },
-  {
-    id: 0x10,
-    key: "roll",
-    bytes: 2,
-    type: "int16",
-    note: "deg ×100",
-    endian: "BE",
-  },
+  { id: 0x0c, key: "gps_lat", bytes: 4, type: "float", note: "GPS latitude" },
+  { id: 0x0d, key: "gps_long", bytes: 4, type: "float", note: "GPS longitude" },
+  { id: 0x0e, key: "yaw", bytes: 2, type: "int16", note: "deg ×100" },
+  { id: 0x0f, key: "pitch", bytes: 2, type: "int16", note: "deg ×100" },
+  { id: 0x10, key: "roll", bytes: 2, type: "int16", note: "deg ×100" },
   {
     id: 0x20,
     key: "oxidizer_pressure_1",
     bytes: 4,
     type: "float",
     note: "CM pressure, bar",
-    endian: "LE",
   },
   {
     id: 0x21,
@@ -208,7 +156,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 4,
     type: "float",
     note: "pre-injector pressure, bar",
-    endian: "LE",
   },
   {
     id: 0x22,
@@ -216,7 +163,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 4,
     type: "float",
     note: "pre-injector pressure (redundant), bar",
-    endian: "LE",
   },
   {
     id: 0x23,
@@ -224,7 +170,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 4,
     type: "float",
     note: "500N load cell",
-    endian: "LE",
   },
   {
     id: 0x24,
@@ -232,7 +177,6 @@ const ArgDefs: readonly ArgDef[] = [
     bytes: 4,
     type: "float",
     note: "5K load cell",
-    endian: "LE",
   },
 ] as const;
 
