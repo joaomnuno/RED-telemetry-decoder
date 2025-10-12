@@ -40,7 +40,7 @@ type ArgDef = {
     | "enum"
     | "bitfield";
   note: string;
-  endian: Endian;
+  endian?: Endian;
 };
 
 type DecodedFrame = {
@@ -72,7 +72,7 @@ type DecodedFrame = {
 };
 
 // ArgID map — fixed-size TLVs
-const ArgDefs = [
+const ArgDefs: ReadonlyArray<ArgDef> = [
   {
     id: 0x01,
     key: "millis",
@@ -303,7 +303,7 @@ function decodeTLV(payload: number[]) {
     i += def.bytes;
 
     let decoded: unknown = val;
-    const endian = def.endian;
+    const endian = def.endian ?? DEFAULT_VALUE_ENDIAN;
 
     switch (def.type) {
       case "uint8":
@@ -626,7 +626,7 @@ function buildDemoFrame(sequenceEndian: Endian) {
   const payload: number[] = [];
   const endianFor = (id: number): Endian => {
     const def = ArgDefs.find((d) => d.id === id);
-    return def ? def.endian : DEFAULT_VALUE_ENDIAN;
+    return def?.endian ?? DEFAULT_VALUE_ENDIAN;
   };
   const pushTLV = (id: number, raw: number[]) => {
     payload.push(id, ...raw);
@@ -775,7 +775,7 @@ export default function TelemetryDecoderApp() {
     if (!def) return `Unknown ArgID 0x${hex2(id)}`;
 
     const fail = (msg: string) => `Arg ${hex2(id)} (${def.key}): ${msg}`;
-    const endian = def.endian;
+    const endian = def.endian ?? DEFAULT_VALUE_ENDIAN;
 
     try {
       switch (def.key) {
