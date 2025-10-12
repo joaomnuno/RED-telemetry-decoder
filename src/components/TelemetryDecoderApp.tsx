@@ -24,6 +24,25 @@ const FLAG_SEQ_LITTLE = 0b000010; // Sequence little-endian if set
 
 type Endian = "LE" | "BE";
 
+const DEFAULT_VALUE_ENDIAN: Endian = "LE";
+const DEFAULT_SEQUENCE_ENDIAN: Endian = "BE";
+
+type ArgDef = {
+  id: number;
+  key: string;
+  bytes: number;
+  type:
+    | "uint8"
+    | "uint16"
+    | "uint32"
+    | "int16"
+    | "float"
+    | "enum"
+    | "bitfield";
+  note: string;
+  endian: Endian;
+};
+
 type DecodedFrame = {
   ok: boolean;
   warnings: string[];
@@ -47,6 +66,7 @@ type DecodedFrame = {
     bytes: number;
     valueRaw: number[];
     valueDecoded: unknown;
+    endian: Endian;
   }>; // decoded TLVs
   command: { id: number; name: string } | null;
 };
@@ -266,7 +286,7 @@ function hexToBytes(input: string): number[] {
 const hex2 = (n: number) => n.toString(16).toUpperCase().padStart(2, "0");
 const hex4 = (n: number) => n.toString(16).toUpperCase().padStart(4, "0");
 
-function decodeTLV(payload: number[], valueEndian: Endian) {
+function decodeTLV(payload: number[]) {
   const out: DecodedFrame["tlv"] = [];
   let i = 0;
   while (i < payload.length) {
@@ -283,21 +303,23 @@ function decodeTLV(payload: number[], valueEndian: Endian) {
     i += def.bytes;
 
     let decoded: unknown = val;
+    const endian = def.endian;
+
     switch (def.type) {
       case "uint8":
         decoded = val[0];
         break;
       case "uint16":
-        decoded = readUint16(val, valueEndian);
+        decoded = readUint16(val, endian);
         break;
       case "int16":
-        decoded = readInt16(val, valueEndian);
+        decoded = readInt16(val, endian);
         break;
       case "uint32":
-        decoded = readUint32(val, valueEndian);
+        decoded = readUint32(val, endian);
         break;
       case "float":
-        decoded = readFloat32(val, valueEndian);
+        decoded = readFloat32(val, endian);
         break;
       case "enum":
         decoded = val[0];
@@ -313,6 +335,7 @@ function decodeTLV(payload: number[], valueEndian: Endian) {
       bytes: def.bytes,
       valueRaw: val,
       valueDecoded: decoded,
+      endian,
     });
   }
   return out;
@@ -403,7 +426,7 @@ function parseFrame(bytes: number[]): DecodedFrame {
   let command: { id: number; name: string } | null = null;
 
   if (headerType === "Telemetry") {
-    tlv = decodeTLV(payloadBytes, valueEndian);
+    tlv = decodeTLV(payloadBytes);
 
     // Sanity checks on TLV integrity
     const seenBytes = tlv.reduce((acc, t) => acc + 1 + t.bytes, 0);
@@ -599,45 +622,49 @@ function renderTLVRow(t: DecodedFrame["tlv"][number]): {
 }
 
 // Build a demo telemetry frame with a few TLVs
-function buildDemoFrame(opts: { valueEndian: Endian; sequenceEndian: Endian }) {
+function buildDemoFrame(sequenceEndian: Endian) {
   const payload: number[] = [];
+  const endianFor = (id: number): Endian => {
+    const def = ArgDefs.find((d) => d.id === id);
+    return def ? def.endian : DEFAULT_VALUE_ENDIAN;
+  };
   const pushTLV = (id: number, raw: number[]) => {
     payload.push(id, ...raw);
   };
-  const enc16 = (v: number) =>
-    opts.valueEndian === "LE"
+  const enc16 = (id: number, v: number) =>
+    endianFor(id) === "LE"
       ? [v & 0xff, (v >> 8) & 0xff]
       : [(v >> 8) & 0xff, v & 0xff];
-  const enc32 = (v: number) => {
-    if (opts.valueEndian === "LE")
+  const enc32 = (id: number, v: number) => {
+    if (endianFor(id) === "LE")
       return [v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff];
     return [(v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
   };
-  const encF32 = (f: number) => {
+  const encF32 = (id: number, f: number) => {
     const buf = new ArrayBuffer(4);
     const dv = new DataView(buf);
-    dv.setFloat32(0, f, opts.valueEndian === "LE");
+    dv.setFloat32(0, f, endianFor(id) === "LE");
     return [dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3)];
   };
 
-  pushTLV(0x01, enc32(123456)); // millis
-  pushTLV(0x02, encF32(326.5)); // altitude m
-  pushTLV(0x03, encF32(-14.5)); // vertical vel
-  pushTLV(0x05, enc16(25)); // avionics temp °C
+  pushTLV(0x01, enc32(0x01, 123456)); // millis
+  pushTLV(0x02, encF32(0x02, 326.5)); // altitude m
+  pushTLV(0x03, encF32(0x03, -14.5)); // vertical vel
+  pushTLV(0x05, enc16(0x05, 25)); // avionics temp °C
   pushTLV(0x07, [3]); // flight mode LIFT_OFF
   pushTLV(0x08, [7]); // air brakes 7%
-  pushTLV(0x0e, enc16(Math.round(12.34 * 100))); // yaw ×100
-  pushTLV(0x0f, enc16(Math.round(-2.5 * 100))); // pitch ×100 (two's complement)
+  pushTLV(0x0e, enc16(0x0e, Math.round(12.34 * 100))); // yaw ×100
+  pushTLV(0x0f, enc16(0x0f, Math.round(-2.5 * 100))); // pitch ×100 (two's complement)
 
   const headerTypeBits = HEADER_TYPE.TELEMETRY << 6; // 0b00 in top bits
   const headerFlags =
-    (opts.valueEndian === "BE" ? FLAG_VALUE_BIG : 0) |
-    (opts.sequenceEndian === "LE" ? FLAG_SEQ_LITTLE : 0);
+    (DEFAULT_VALUE_ENDIAN === "BE" ? FLAG_VALUE_BIG : 0) |
+    (sequenceEndian === "LE" ? FLAG_SEQ_LITTLE : 0);
   const header = headerTypeBits | headerFlags;
 
   const sequenceVal = 42;
   const seqBytes =
-    opts.sequenceEndian === "BE"
+    sequenceEndian === "BE"
       ? [(sequenceVal >> 8) & 0xff, sequenceVal & 0xff]
       : [sequenceVal & 0xff, (sequenceVal >> 8) & 0xff];
 
@@ -654,8 +681,6 @@ function buildDemoFrame(opts: { valueEndian: Endian; sequenceEndian: Endian }) {
 export default function TelemetryDecoderApp() {
   const [tab, setTab] = useState<"decode" | "generate">("decode");
   const [hexInput, setHexInput] = useState<string>("");
-  const [valueEndian, setValueEndian] = useState<Endian>("LE"); // common on ARM
-  const [seqEndian, setSeqEndian] = useState<Endian>("BE"); // conservative default
 
   // ===== Generator state =====
   const [genType, setGenType] = useState<"Telemetry" | "Command">("Telemetry");
@@ -697,8 +722,7 @@ export default function TelemetryDecoderApp() {
     }
   }, [hexInput]);
 
-  const loadDemo = () =>
-    setHexInput(buildDemoFrame({ valueEndian, sequenceEndian: seqEndian }));
+  const loadDemo = () => setHexInput(buildDemoFrame(DEFAULT_SEQUENCE_ENDIAN));
 
   // ====== Generator helpers ======
   const addGenItem = (id: number, value: string) =>
@@ -745,13 +769,13 @@ export default function TelemetryDecoderApp() {
 
   function encodeTLVItem(
     id: number,
-    valueStr: string,
-    endian: Endian
+    valueStr: string
   ): number[] | string {
     const def = ArgDefs.find((d) => d.id === id);
     if (!def) return `Unknown ArgID 0x${hex2(id)}`;
 
     const fail = (msg: string) => `Arg ${hex2(id)} (${def.key}): ${msg}`;
+    const endian = def.endian;
 
     try {
       switch (def.key) {
@@ -835,7 +859,7 @@ export default function TelemetryDecoderApp() {
     const payload: number[] = [];
     for (let i = 0; i < genItems.length; i++) {
       const { id, value } = genItems[i];
-      const encoded = encodeTLVItem(id, value, valueEndian);
+      const encoded = encodeTLVItem(id, value);
       if (typeof encoded === "string") {
         errs.push(encoded);
         continue;
@@ -861,8 +885,8 @@ export default function TelemetryDecoderApp() {
         ? HEADER_TYPE.TELEMETRY << 6
         : HEADER_TYPE.COMMAND << 6;
     const autoFlags =
-      (valueEndian === "BE" ? FLAG_VALUE_BIG : 0) |
-      (seqEndian === "LE" ? FLAG_SEQ_LITTLE : 0);
+      (DEFAULT_VALUE_ENDIAN === "BE" ? FLAG_VALUE_BIG : 0) |
+      (DEFAULT_SEQUENCE_ENDIAN === "LE" ? FLAG_SEQ_LITTLE : 0);
     const userFlags = genFlags & 0b0011_1111;
     const headerFlags =
       (userFlags & ~(FLAG_VALUE_BIG | FLAG_SEQ_LITTLE)) | autoFlags;
@@ -871,7 +895,7 @@ export default function TelemetryDecoderApp() {
     // Sequence
     let seqHi: number, seqLo: number;
     const s = Math.max(0, Math.min(0xffff, Math.floor(genSeq)));
-    if (seqEndian === "BE") {
+    if (DEFAULT_SEQUENCE_ENDIAN === "BE") {
       seqHi = (s >> 8) & 0xff;
       seqLo = s & 0xff;
     } else {
@@ -901,30 +925,6 @@ export default function TelemetryDecoderApp() {
     <div className="mx-auto max-w-5xl p-4 space-y-6">
       <header className="flex items-center justify-between">
         <h1 className="text-2xl font-bold">Rocket Telemetry Decoder</h1>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 text-sm">
-            <label className="font-medium">Value endian</label>
-            <select
-              className="border rounded-md px-2 py-1"
-              value={valueEndian}
-              onChange={(e) => setValueEndian(e.target.value as Endian)}
-            >
-              <option value="LE">Little-endian</option>
-              <option value="BE">Big-endian</option>
-            </select>
-          </div>
-          <div className="flex items-center gap-2 text-sm">
-            <label className="font-medium">Sequence endian</label>
-            <select
-              className="border rounded-md px-2 py-1"
-              value={seqEndian}
-              onChange={(e) => setSeqEndian(e.target.value as Endian)}
-            >
-              <option value="BE">Big-endian</option>
-              <option value="LE">Little-endian</option>
-            </select>
-          </div>
-        </div>
       </header>
 
       {/* Simple tabs */}
@@ -1226,17 +1226,13 @@ export default function TelemetryDecoderApp() {
                   <ul className="space-y-2">
                     {genItems.map((it, idx) => {
                       const def = ArgDefs.find((d) => d.id === it.id)!;
-                      const preview = encodeTLVItem(
-                        it.id,
-                        it.value,
-                        valueEndian
-                      );
+                      const preview = encodeTLVItem(it.id, it.value);
                       const err = typeof preview === "string" ? preview : null;
                       const raw = Array.isArray(preview)
                         ? preview.slice(1)
                         : [];
                       const dec = Array.isArray(preview)
-                        ? decodeTLV(preview, valueEndian)[0]
+                        ? decodeTLV(preview)[0]
                         : undefined;
                       return (
                         <li key={idx} className="rounded-lg border p-2 text-sm">
